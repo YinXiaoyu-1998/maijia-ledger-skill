@@ -1,0 +1,7 @@
+interface:
+  display_name: "麦家台账生成"
+  short_description: "将麦家收货单Excel生成或追加更新为进货台账"
+  brand_color: "#3F7D58"
+  default_prompt: "Use $maijia-ledger to generate or update a ledger from receipt Excel files."
+policy:
+  allow_implicit_invocation: true

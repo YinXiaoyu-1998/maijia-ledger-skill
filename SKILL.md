@@ -29,9 +29,10 @@ It requires Python 3 and `openpyxl`; if `import openpyxl` fails, use the local w
 
 ## Output Behavior
 
-- If no output path is specified and no existing ledger is provided, the default output file is `台账.xlsx` in the current working directory.
+- Unless the user explicitly requests a different output filename, do not invent a date- or folder-based filename such as `台账_0828.xlsx`.
+- For a new ledger, omit `-output` by default so the script writes `台账.xlsx` in the current working directory.
 - If `-original_file` is provided and no `-output` is specified, the script updates that existing ledger in place.
-- Use `-output <path>` when the user wants a separate generated copy.
+- Use `-output <path>` only when the user asks for a separate generated copy or a specific filename.
 - When updating an existing ledger, the script reads existing `收货单号` values first and skips any input receipt whose `单据号` is already present.
 
 ## Field Mapping

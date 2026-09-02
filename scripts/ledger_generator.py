@@ -104,7 +104,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "-output",
         dest="output",
         type=Path,
-        help="输出台账文件；未提供时，新建默认为 台账.xlsx，追加默认为覆盖已有台账",
+        help="输出台账文件；未提供时，新建输出 台账.xlsx，提供 -original_file 时原地更新该台账",
     )
 
     args = parser.parse_args(argv)

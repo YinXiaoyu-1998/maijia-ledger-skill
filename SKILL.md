@@ -25,15 +25,17 @@ It requires Python 3 and `openpyxl`; if `import openpyxl` fails, use the local w
 
 - Receipt files are exported Excel workbooks like `麦家小馆（门店）-配送收货单SH....xlsx`.
 - A folder input may contain many receipt files. Temporary files such as `~$...xlsx` or `.~...xlsx` should be ignored.
-- Supplier catalog enrichment is optional. If the user has `supplier_catalog.xlsx`, pass it with `-supplier_catalog <path>` or place it in the current working directory. If no supplier catalog is available, still generate/update the ledger and leave `供货单位联系方式` blank.
+- Supplier catalog enrichment is optional. If the user has `supplier_catalog.xlsx` or `供应商档案.xlsx`, pass it with `-supplier_catalog <path>` or place it in the current working directory, receipt folder, or receipt folder's parent directory. If no supplier catalog is available, still generate/update the ledger and leave `供货单位联系方式` blank.
 
 ## Output Behavior
 
-- Unless the user explicitly requests a different output filename, do not invent a date- or folder-based filename such as `台账_0828.xlsx`.
-- For a new ledger, omit `-output` by default so the script writes `台账.xlsx` in the current working directory.
-- If `-original_file` is provided and no `-output` is specified, the script updates that existing ledger in place.
-- Use `-output <path>` only when the user asks for a separate generated copy or a specific filename.
-- When updating an existing ledger, the script reads existing `收货单号` values first and skips any input receipt whose `单据号` is already present.
+- By default, omit both `-original_file` and `-output`. The script must maintain one ledger workbook per store, using the receipt `订货机构` as the store name.
+- Default store ledger filenames are `台账_<订货机构>.xlsx`, for example `台账_麦家小馆（通州保利店）.xlsx`.
+- In default mode, if a store ledger already exists, update that existing file; if it does not exist, create it. Do not require the user to provide existing ledger filenames for routine daily updates.
+- Only store ledgers for stores present in the current input receipts should be created or updated. Existing ledgers for stores absent from the current input must be left untouched.
+- If `-original_file` is provided, the script updates that explicitly selected ledger in place unless `-output` is also provided.
+- Use `-output <path>` only when the user asks for a separate generated copy, a specific single-store filename, or a custom output folder.
+- When updating any existing ledger, the script reads existing `收货单号` values first and skips any input receipt whose `单据号` is already present.
 
 ## Field Mapping
 
@@ -63,10 +65,12 @@ Keep the ledger column order close to the paper ledger:
 
 After running the script, inspect the generated workbook enough to verify:
 
-- Data row count is plausible for the processed receipts.
-- Distinct `收货单号` count matches processed non-duplicate receipt files.
+- The generated/updated store ledger file count matches the stores present in the current input receipts.
+- Each default store ledger contains rows for only its own `门店名`.
+- Combined data row count across the affected store ledgers is plausible for the processed receipts.
+- Distinct `收货单号` counts match processed non-duplicate receipt files.
 - `生产日期或生产批号`, `保质期`, and `供货单位地址` are blank.
 - Known suppliers from the catalog have phone numbers, and unmatched suppliers remain blank without blocking the run.
-- Re-running with `-original_file <ledger>` against the same receipts appends zero rows.
+- Re-running default mode against the same receipts appends zero rows because each existing store ledger skips duplicate `收货单号` values.
 
-Report the output path and a short run summary to the user. Mention supplier catalog absence or unmatched suppliers only as operational notes, not as errors.
+Report the affected output paths and a short run summary to the user. Mention supplier catalog absence or unmatched suppliers only as operational notes, not as errors.

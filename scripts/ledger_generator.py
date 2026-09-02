@@ -44,6 +44,7 @@ LEDGER_HEADERS = [
 REQUIRED_DETAIL_HEADERS = ["序号", "物品名称", "规格型号", "收货数量", "收货金额"]
 REQUIRED_META_HEADERS = ["单据号", "订货机构", "送货机构", "收货日期"]
 EXCEL_SUFFIXES = {".xlsx", ".xlsm"}
+SUPPLIER_CATALOG_FILENAMES = ("supplier_catalog.xlsx", "供应商档案.xlsx")
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,9 @@ class RunSummary:
     skipped_invalid_files: int = 0
     appended_rows: int = 0
     supplier_catalog_used: bool = False
+    created_ledgers: int = 0
+    updated_ledgers: int = 0
+    output_files: list[Path] | None = None
     warnings: list[str] | None = None
 
     def add_warning(self, message: str) -> None:
@@ -77,6 +81,12 @@ class RunSummary:
             self.warnings = []
         if message not in self.warnings:
             self.warnings.append(message)
+
+    def add_output_file(self, path: Path) -> None:
+        if self.output_files is None:
+            self.output_files = []
+        if path not in self.output_files:
+            self.output_files.append(path)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -98,13 +108,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "-supplier_catalog",
         dest="supplier_catalog",
         type=Path,
-        help="可选供应商档案文件；未提供时自动尝试读取当前目录的 supplier_catalog.xlsx",
+        help="可选供应商档案文件；未提供时自动寻找 supplier_catalog.xlsx 或 供应商档案.xlsx",
     )
     parser.add_argument(
         "-output",
         dest="output",
         type=Path,
-        help="输出台账文件；未提供时，新建输出 台账.xlsx，提供 -original_file 时原地更新该台账",
+        help="可选输出路径；默认按门店自动创建或更新 台账_<门店名>.xlsx；多门店时可提供输出文件夹",
     )
 
     args = parser.parse_args(argv)
@@ -299,18 +309,8 @@ def parse_receipt(path: Path) -> tuple[str, list[ReceiptItem]]:
     return document_no, items
 
 
-def prepare_ledger(original_file: Path | None) -> tuple[Workbook, Worksheet, int, dict[str, int]]:
-    """Open an existing ledger or create a new one with standard headers."""
-
-    if original_file is not None:
-        if not original_file.is_file():
-            raise FileNotFoundError(f"找不到已有台账: {original_file}")
-        wb = load_workbook(original_file)
-        ws = wb.active
-        header_row = find_header_row(ws, ["收货单号"], max_rows=20)
-        header_map = row_header_map(ws, header_row)
-        ensure_ledger_headers(ws, header_row, header_map)
-        return wb, ws, header_row, row_header_map(ws, header_row)
+def new_ledger_workbook() -> tuple[Workbook, Worksheet, int, dict[str, int]]:
+    """Create a new ledger workbook with standard headers."""
 
     wb = Workbook()
     ws = wb.active
@@ -319,6 +319,28 @@ def prepare_ledger(original_file: Path | None) -> tuple[Workbook, Worksheet, int
         ws.cell(1, column_number, header)
     style_header(ws, 1)
     return wb, ws, 1, row_header_map(ws, 1)
+
+
+def prepare_ledger(
+    ledger_file: Path | None, create_if_missing: bool = False
+) -> tuple[Workbook, Worksheet, int, dict[str, int]]:
+    """Open an existing ledger or create a new one with standard headers."""
+
+    if ledger_file is None:
+        return new_ledger_workbook()
+
+    if ledger_file.is_file():
+        wb = load_workbook(ledger_file)
+        ws = wb.active
+        header_row = find_header_row(ws, ["收货单号"], max_rows=20)
+        header_map = row_header_map(ws, header_row)
+        ensure_ledger_headers(ws, header_row, header_map)
+        return wb, ws, header_row, row_header_map(ws, header_row)
+
+    if create_if_missing:
+        return new_ledger_workbook()
+
+    raise FileNotFoundError(f"找不到已有台账: {ledger_file}")
 
 
 def ensure_ledger_headers(ws: Worksheet, header_row: int, header_map: dict[str, int]) -> None:
@@ -454,48 +476,103 @@ def output_path_for(original_file: Path | None, output: Path | None) -> Path:
     return Path("台账.xlsx")
 
 
-def resolve_supplier_catalog_path(catalog_path: Path | None) -> Path | None:
+def safe_filename_part(value: str) -> str:
+    """Return a filesystem-safe filename component."""
+
+    cleaned = "".join("_" if char in '<>:"/\\|?*' or ord(char) < 32 else char for char in value)
+    cleaned = cleaned.strip().strip(".")
+    return cleaned or "未命名门店"
+
+
+def default_store_ledger_filename(store_name: str) -> str:
+    """Return the default ledger filename for one store."""
+
+    return f"台账_{safe_filename_part(store_name)}.xlsx"
+
+
+def output_path_for_store(store_name: str, output: Path | None, store_count: int) -> Path:
+    """Choose the destination ledger path for one store in split-ledger mode."""
+
+    default_name = default_store_ledger_filename(store_name)
+    if output is None:
+        return Path(default_name)
+    if output.suffix.lower() in EXCEL_SUFFIXES:
+        if store_count == 1:
+            return output
+        raise ValueError("多门店输入不能把 -output 指向单个 Excel 文件；请省略 -output 或提供输出文件夹。")
+    return output / default_name
+
+
+def candidate_catalog_dirs(input_dir: Path | None, new_file: Path | None) -> list[Path]:
+    """Return likely directories that may contain a supplier catalog."""
+
+    candidates = [Path.cwd()]
+    if input_dir is not None:
+        candidates.extend([input_dir, input_dir.parent])
+    if new_file is not None:
+        candidates.extend([new_file.parent, new_file.parent.parent])
+
+    unique_candidates: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def resolve_supplier_catalog_path(
+    catalog_path: Path | None, input_dir: Path | None, new_file: Path | None
+) -> Path | None:
     """Return the supplier catalog to use, if one is available."""
 
     if catalog_path is not None:
         return catalog_path
 
-    default_path = Path("supplier_catalog.xlsx")
-    if default_path.is_file():
-        return default_path
+    for candidate_dir in candidate_catalog_dirs(input_dir, new_file):
+        for filename in SUPPLIER_CATALOG_FILENAMES:
+            candidate = candidate_dir / filename
+            if candidate.is_file():
+                return candidate
     return None
 
 
-def generate_ledger(args: argparse.Namespace) -> RunSummary:
-    """Generate or update the ledger according to parsed arguments."""
+def load_supplier_phones(args: argparse.Namespace, summary: RunSummary) -> dict[str, str]:
+    """Load optional supplier phone lookup data."""
 
-    summary = RunSummary()
-    input_files = collect_input_files(args.input_dir, args.new_file)
-    summary.input_files = len(input_files)
-    if not input_files:
-        raise ValueError("没有找到可处理的 Excel 收货单据。")
-
-    phone_by_supplier: dict[str, str] = {}
-    supplier_catalog_path = resolve_supplier_catalog_path(args.supplier_catalog)
+    supplier_catalog_path = resolve_supplier_catalog_path(
+        args.supplier_catalog, args.input_dir, args.new_file
+    )
     if supplier_catalog_path is None:
         summary.add_warning("未提供供应商目录，供货单位联系方式将留空。")
-    elif supplier_catalog_path.is_file():
-        phone_by_supplier = read_supplier_phones(supplier_catalog_path)
+        return {}
+    if supplier_catalog_path.is_file():
         summary.supplier_catalog_used = True
-    else:
-        summary.add_warning(f"供应商目录不存在，供货单位联系方式将留空: {supplier_catalog_path}")
-    wb, ws, header_row, header_map = prepare_ledger(args.original_file)
+        return read_supplier_phones(supplier_catalog_path)
+
+    summary.add_warning(f"供应商目录不存在，供货单位联系方式将留空: {supplier_catalog_path}")
+    return {}
+
+
+def append_receipts_to_ledger(
+    source_file: Path,
+    destination_file: Path,
+    receipts: list[tuple[str, list[ReceiptItem]]],
+    phone_by_supplier: dict[str, str],
+    summary: RunSummary,
+    create_if_missing: bool,
+) -> int:
+    """Append parsed receipts into one ledger file and return appended row count."""
+
+    source_existed = source_file.is_file()
+    destination_existed = destination_file.is_file()
+    wb, ws, header_row, header_map = prepare_ledger(source_file, create_if_missing=create_if_missing)
     seen_document_numbers = existing_document_numbers(ws, header_row, header_map)
     sequence = next_sequence_number(ws, header_row, header_map)
+    appended_rows = 0
 
-    for input_file in input_files:
-        try:
-            document_no, items = parse_receipt(input_file)
-        except (BadZipFile, KeyError, OSError, ValueError) as exc:
-            summary.skipped_invalid_files += 1
-            summary.add_warning(f"跳过 {input_file.name}: {exc}")
-            continue
-
+    for document_no, items in receipts:
         if document_no in seen_document_numbers:
             summary.skipped_duplicate_files += 1
             continue
@@ -503,31 +580,133 @@ def generate_ledger(args: argparse.Namespace) -> RunSummary:
         summary.parsed_files += 1
         before_sequence = sequence
         sequence = append_items(ws, header_map, items, phone_by_supplier, sequence)
-        summary.appended_rows += sequence - before_sequence
+        added_rows = sequence - before_sequence
+        appended_rows += added_rows
+        summary.appended_rows += added_rows
         seen_document_numbers.add(document_no)
 
         if summary.supplier_catalog_used and items and items[0].supplier_name not in phone_by_supplier:
             summary.add_warning(f"供应商未匹配，联系方式留空: {items[0].supplier_name}")
 
+    if appended_rows == 0 and source_existed and source_file == destination_file:
+        return 0
+
     style_header(ws, header_row)
     format_ledger(ws, header_row, header_map)
+    destination_file.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(destination_file)
+    summary.add_output_file(destination_file)
+    if source_existed or destination_existed:
+        summary.updated_ledgers += 1
+    else:
+        summary.created_ledgers += 1
+    return appended_rows
+
+
+def parse_receipt_files(
+    input_files: list[Path], summary: RunSummary
+) -> list[tuple[str, list[ReceiptItem]]]:
+    """Parse input files while collecting invalid-file warnings."""
+
+    parsed_receipts: list[tuple[str, list[ReceiptItem]]] = []
+    for input_file in input_files:
+        try:
+            document_no, items = parse_receipt(input_file)
+        except (BadZipFile, KeyError, OSError, ValueError) as exc:
+            summary.skipped_invalid_files += 1
+            summary.add_warning(f"跳过 {input_file.name}: {exc}")
+            continue
+        if not items:
+            summary.skipped_invalid_files += 1
+            summary.add_warning(f"跳过 {input_file.name}: 没有可写入台账的物品明细。")
+            continue
+        parsed_receipts.append((document_no, items))
+    return parsed_receipts
+
+
+def generate_single_ledger(
+    args: argparse.Namespace,
+    receipts: list[tuple[str, list[ReceiptItem]]],
+    phone_by_supplier: dict[str, str],
+    summary: RunSummary,
+) -> None:
+    """Update one explicitly selected ledger file."""
 
     destination = output_path_for(args.original_file, args.output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(destination)
+    source = args.original_file if args.original_file is not None else destination
+    append_receipts_to_ledger(
+        source,
+        destination,
+        receipts,
+        phone_by_supplier,
+        summary,
+        create_if_missing=args.original_file is None,
+    )
+
+
+def generate_store_ledgers(
+    args: argparse.Namespace,
+    receipts: list[tuple[str, list[ReceiptItem]]],
+    phone_by_supplier: dict[str, str],
+    summary: RunSummary,
+) -> None:
+    """Create or update one ledger file per store."""
+
+    receipts_by_store: dict[str, list[tuple[str, list[ReceiptItem]]]] = {}
+    for document_no, items in receipts:
+        store_name = items[0].store_name
+        receipts_by_store.setdefault(store_name, []).append((document_no, items))
+
+    store_count = len(receipts_by_store)
+    for store_name, store_receipts in sorted(receipts_by_store.items()):
+        destination = output_path_for_store(store_name, args.output, store_count)
+        append_receipts_to_ledger(
+            destination,
+            destination,
+            store_receipts,
+            phone_by_supplier,
+            summary,
+            create_if_missing=True,
+        )
+
+
+def generate_ledger(args: argparse.Namespace) -> RunSummary:
+    """Generate or update ledgers according to parsed arguments."""
+
+    summary = RunSummary()
+    input_files = collect_input_files(args.input_dir, args.new_file)
+    summary.input_files = len(input_files)
+    if not input_files:
+        raise ValueError("没有找到可处理的 Excel 收货单据。")
+
+    phone_by_supplier = load_supplier_phones(args, summary)
+    receipts = parse_receipt_files(input_files, summary)
+    if not receipts:
+        raise ValueError("没有成功解析任何收货单据。")
+
+    if args.original_file is not None:
+        generate_single_ledger(args, receipts, phone_by_supplier, summary)
+    else:
+        generate_store_ledgers(args, receipts, phone_by_supplier, summary)
+
     return summary
 
 
-def print_summary(summary: RunSummary, destination: Path) -> None:
+def print_summary(summary: RunSummary) -> None:
     """Print a compact run summary."""
 
-    print(f"输出文件: {destination}")
     print(f"输入文件: {summary.input_files}")
     print(f"成功处理: {summary.parsed_files}")
     print(f"追加行数: {summary.appended_rows}")
     print(f"跳过重复单据: {summary.skipped_duplicate_files}")
     print(f"跳过无效文件: {summary.skipped_invalid_files}")
     print(f"使用供应商目录: {'是' if summary.supplier_catalog_used else '否'}")
+    print(f"新建台账: {summary.created_ledgers}")
+    print(f"更新台账: {summary.updated_ledgers}")
+    if summary.output_files:
+        print("输出文件:")
+        for output_file in summary.output_files:
+            print(f"- {output_file}")
     if summary.warnings:
         print("提示:")
         for warning in summary.warnings:
@@ -538,13 +717,12 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
 
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    destination = output_path_for(args.original_file, args.output)
     try:
         summary = generate_ledger(args)
     except Exception as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
-    print_summary(summary, destination)
+    print_summary(summary)
     return 0
 
 
